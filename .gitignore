@@ -1,0 +1,14 @@
+# Compiled binaries
+file-sync-server
+file-sync-client
+
+# Test data
+tests/data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
