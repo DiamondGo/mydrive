@@ -118,17 +118,27 @@ func WalkDirectory(baseDir string) ([]*protocol.FileEntry, error) {
 }
 
 // ApplyAttrs sets permissions and timestamps on a file.
+// Permission errors on chmod/chown are logged as warnings but do not
+// cause a fatal error, since the server process may not own the files.
 func ApplyAttrs(path string, entry *protocol.FileEntry) error {
-	// Set permissions
+	// Set permissions (best-effort — may fail if not owner)
 	if err := os.Chmod(path, os.FileMode(entry.Mode)); err != nil {
-		return fmt.Errorf("chmod %s: %w", path, err)
+		if os.IsPermission(err) {
+			fmt.Printf("warning: chmod %s: %v (skipped)\n", path, err)
+		} else {
+			return fmt.Errorf("chmod %s: %w", path, err)
+		}
 	}
 
-	// Set timestamps
+	// Set timestamps (best-effort — may fail if not owner)
 	mtime := time.Unix(0, entry.MTime)
 	atime := time.Unix(0, entry.ATime)
 	if err := os.Chtimes(path, atime, mtime); err != nil {
-		return fmt.Errorf("chtimes %s: %w", path, err)
+		if os.IsPermission(err) {
+			fmt.Printf("warning: chtimes %s: %v (skipped)\n", path, err)
+		} else {
+			return fmt.Errorf("chtimes %s: %w", path, err)
+		}
 	}
 
 	return nil

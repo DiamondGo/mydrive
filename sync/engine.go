@@ -96,8 +96,8 @@ func (e *Engine) SetRemoteTree(tree *protocol.SyncTree) {
 // ComputeDiff computes changes needed to make the local state match the remote state.
 func (e *Engine) ComputeDiff() []*protocol.ChangeEvent {
 	e.mu.RLock()
-	local := e.remoteTree
-	remote := e.localTree
+	local := e.localTree
+	remote := e.remoteTree
 	e.mu.RUnlock()
 	return Diff(local, remote)
 }
@@ -226,6 +226,14 @@ func (e *Engine) ClearTombstone(path string) {
 	e.tombMu.Lock()
 	defer e.tombMu.Unlock()
 	delete(e.tombstones, path)
+}
+
+// AddTombstone marks a path as deleted (tombstoned) so it won't be
+// re-created during future initial syncs.
+func (e *Engine) AddTombstone(path string) {
+	e.tombMu.Lock()
+	defer e.tombMu.Unlock()
+	e.tombstones[path] = true
 }
 
 // AddToPreviousPaths adds paths to the set of previously known paths.

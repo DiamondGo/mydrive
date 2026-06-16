@@ -110,8 +110,15 @@ func main() {
 // It returns nil if the context was cancelled (clean shutdown), or an error if the
 // connection was lost and reconnection should be attempted.
 func runSession(ctx context.Context, client *netlayer.Client, cfg *config.ClientConfig) error {
-	// Create sync engine (fresh state for each session)
+	// Reuse sync engine across sessions to preserve tombstones
 	engine := sync.NewEngine(cfg.LocalDir)
+
+	// Ensure tombstones are saved on session end so they survive reconnections
+	defer func() {
+		if err := engine.SaveTombstones(); err != nil {
+			fmt.Printf("save tombstones: %v\n", err)
+		}
+	}()
 
 	// Initial scan
 	if err := engine.ScanLocal(); err != nil {
@@ -176,7 +183,7 @@ func runSession(ctx context.Context, client *netlayer.Client, cfg *config.Client
 				break
 			}
 			if dataMsg.Type == protocol.MSG_FILE_DATA {
-				if err := handleServerMessage(dataMsg, engine, client); err != nil {
+				if err := handleServerMessage(dataMsg, engine, client, nil); err != nil {
 					fmt.Printf("  handle file data: %v\n", err)
 				}
 			} else {
@@ -194,6 +201,30 @@ func runSession(ctx context.Context, client *netlayer.Client, cfg *config.Client
 			for _, c := range toSend {
 				handleLocalEvent(c, engine, client)
 			}
+		}
+
+		// Send delete messages for files the server has but the client
+		// has previously deleted (tombstoned). This prevents the server
+		// from re-sending these files on subsequent syncs.
+		tombstones := engine.Tombstones()
+		if len(tombstones) > 0 {
+			serverPaths := engine.RemoteTree().Paths()
+			deleteSent := 0
+			for path := range tombstones {
+				if serverPaths[path] {
+					// Server still has this file, tell it to delete
+					if err := client.SendFileDelete(path); err != nil {
+						fmt.Printf("  send tombstone delete: %v\n", err)
+					} else {
+						deleteSent++
+					}
+				}
+			}
+			if deleteSent > 0 {
+				fmt.Printf("  sent %d tombstone deletions to server\n", deleteSent)
+			}
+			// Clear tombstones after communicating them
+			engine.ClearTombstones()
 		}
 	}
 
@@ -248,7 +279,7 @@ func runSession(ctx context.Context, client *netlayer.Client, cfg *config.Client
 			return fmt.Errorf("read: %v", err)
 		}
 
-		if err := handleServerMessage(msg, engine, client); err != nil {
+		if err := handleServerMessage(msg, engine, client, monitor); err != nil {
 			fmt.Printf("handle: %v\n", err)
 		}
 	}
@@ -293,19 +324,31 @@ func handleLocalEvent(event *protocol.ChangeEvent, engine *sync.Engine, client *
 	}
 }
 
-func handleServerMessage(msg *protocol.Message, engine *sync.Engine, client *netlayer.Client) error {
+func handleServerMessage(msg *protocol.Message, engine *sync.Engine, client *netlayer.Client, monitor *sync.Monitor) error {
 	switch msg.Type {
 	case protocol.MSG_FILE_CREATE:
 		fmt.Printf("  server create: %s\n", msg.FileCreate.Path)
+		// Ignore in monitor to prevent feedback loop
+		if monitor != nil {
+			monitor.Ignore(msg.FileCreate.Path, 2*time.Second)
+		}
 		return nil
 
 	case protocol.MSG_FILE_MODIFY:
 		fmt.Printf("  server modify: %s\n", msg.FileModify.Path)
+		// Ignore in monitor to prevent feedback loop
+		if monitor != nil {
+			monitor.Ignore(msg.FileModify.Path, 2*time.Second)
+		}
 		return nil
 
 	case protocol.MSG_FILE_DATA:
 		chunk := msg.FileData
 		fullPath := filepath.Join(engine.BaseDir(), chunk.Path)
+		// Ignore in monitor to prevent feedback loop
+		if monitor != nil {
+			monitor.Ignore(chunk.Path, 2*time.Second)
+		}
 		_ = utils.EnsureDir(fullPath)
 		if err := utils.WriteChunkAt(fullPath, chunk.Data, int64(chunk.Offset)); err != nil {
 			return fmt.Errorf("write chunk: %w", err)
@@ -314,6 +357,11 @@ func handleServerMessage(msg *protocol.Message, engine *sync.Engine, client *net
 
 	case protocol.MSG_FILE_DELETE:
 		fmt.Printf("  server delete: %s\n", msg.FileDelete)
+		// Ignore in monitor to prevent the deletion from being sent back
+		// to the server as a new delete event
+		if monitor != nil {
+			monitor.Ignore(msg.FileDelete, 2*time.Second)
+		}
 		path := filepath.Join(engine.BaseDir(), msg.FileDelete)
 		if err := utils.DeleteEntry(path); err != nil {
 			return fmt.Errorf("delete file: %w", err)

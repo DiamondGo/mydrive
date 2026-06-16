@@ -87,7 +87,7 @@ func main() {
 		// Create a per-session context so monitorClientChanges stops when this client disconnects
 		sessionCtx, sessionCancel := context.WithCancel(ctx)
 		defer sessionCancel()
-		handleClient(sessionCtx, session, engine, srv, cfg)
+		handleClient(sessionCtx, session, engine, srv, cfg, monitor)
 	}); err != nil {
 		// Check if shutdown was requested
 		select {
@@ -100,7 +100,7 @@ func main() {
 	}
 }
 
-func handleClient(ctx context.Context, session *netlayer.ClientSession, engine *sync.Engine, srv *netlayer.Server, cfg *config.ServerConfig) {
+func handleClient(ctx context.Context, session *netlayer.ClientSession, engine *sync.Engine, srv *netlayer.Server, cfg *config.ServerConfig, monitor *sync.Monitor) {
 	// Rescan local directory to ensure tombstones are up-to-date
 	// (monitor events may not have fired yet)
 	engine.ScanLocal()
@@ -251,25 +251,33 @@ func handleClient(ctx context.Context, session *netlayer.ClientSession, engine *
 			return
 		}
 
-		if err := handleMessage(session, msg, engine, srv); err != nil {
+		if err := handleMessage(session, msg, engine, srv, monitor); err != nil {
 			fmt.Printf("client %d: handle: %v\n", session.ID, err)
-			return
+			// Non-fatal errors (e.g. permission denied on chmod) should not
+			// disconnect the client. Only return on I/O errors that indicate
+			// the connection is broken.
 		}
 	}
 }
 
-func handleMessage(session *netlayer.ClientSession, msg *protocol.Message, engine *sync.Engine, srv *netlayer.Server) error {
+func handleMessage(session *netlayer.ClientSession, msg *protocol.Message, engine *sync.Engine, srv *netlayer.Server, monitor *sync.Monitor) error {
 	switch msg.Type {
 	case protocol.MSG_FILE_CREATE:
+		// Ignore this path in the monitor to prevent feedback loops
+		monitor.Ignore(msg.FileCreate.Path, 2*time.Second)
 		if err := applyFileCreate(engine.BaseDir(), msg.FileCreate); err != nil {
 			return fmt.Errorf("create file: %w", err)
 		}
 		fmt.Printf("client %d: created %s\n", session.ID, msg.FileCreate.Path)
+		// Clear any tombstone for this path since it's being re-created
+		engine.ClearTombstone(msg.FileCreate.Path)
 		engine.RemoteTree().Set(msg.FileCreate)
 		engine.ScanLocal()
 		return nil
 
 	case protocol.MSG_FILE_MODIFY:
+		// Ignore this path in the monitor to prevent feedback loops
+		monitor.Ignore(msg.FileModify.Path, 2*time.Second)
 		if err := applyFileModify(engine.BaseDir(), msg.FileModify); err != nil {
 			return fmt.Errorf("modify file: %w", err)
 		}
@@ -279,11 +287,20 @@ func handleMessage(session *netlayer.ClientSession, msg *protocol.Message, engin
 
 	case protocol.MSG_FILE_DELETE:
 		path := filepath.Join(engine.BaseDir(), msg.FileDelete)
+		// Ignore this path in the monitor to prevent feedback loops
+		// (the monitor would detect the deletion and try to broadcast it back)
+		monitor.Ignore(msg.FileDelete, 2*time.Second)
 		if err := utils.DeleteEntry(path); err != nil {
 			return fmt.Errorf("delete file: %w", err)
 		}
+		// Remove from both trees so monitorClientChanges won't re-send it
 		engine.RemoteTree().Remove(msg.FileDelete)
+		engine.LocalTree().Remove(msg.FileDelete)
+		// Add to tombstones so it won't be re-created on next initial sync
+		engine.AddTombstone(msg.FileDelete)
 		engine.ScanLocal()
+		// Broadcast the delete to other connected clients
+		srv.Broadcast(session.ID, msg)
 		return nil
 
 	case protocol.MSG_FILE_DATA:
